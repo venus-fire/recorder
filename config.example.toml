@@ -1,0 +1,66 @@
+# Voice recorder pipeline settings.
+# Copy to ~/.config/recorder/config.toml and uncomment what you want to change.
+# Everything here overrides the DEFAULTS dict at the top of recorder.py.
+
+# device_label = "WS-852"          # the filesystem label the watcher polls for
+# device_id_glob = "usb-OLYMPUS_DVR*"
+# audio_dir = "~/Recordings"       # flat archive of the pulled audio
+# vault = "~/Documents/OBSIDIAN"
+# transcripts_subdir = "Transcripts"
+
+# --- transcription ---------------------------------------------------------
+# model = "~/.local/share/recorder/models/whisper-large-v3-turbo"
+# compute_type = "float16"   # float16 | int8_float16 | int8
+# beam_size = 5
+# vad = true                 # skip silence
+# language = ""              # "" = detect per file, or pin e.g. "en"
+# min_speech_seconds = 1.0   # below this the note is marked as no-speech
+
+# --- who this is for -------------------------------------------------------
+# The vocab the transcriber should expect, and the name the action-item prompts
+# use. Both live here so the code itself carries no personal details.
+# initial_prompt = "Voice notes and recorded conversations. Sam Rivera, Northside Clinic, Portland Oregon."
+# subject = "Sam"
+
+# --- summarization (Fireworks API) -----------------------------------------
+# summarize = true
+# summary_model = "accounts/fireworks/routers/deepseek-flash-latest"
+# summary_max_tokens = 6000  # the model is a reasoner; too low returns empty
+# summary_name_prefix = "date"  # "date" or "none": prefix summary filenames with the recording date
+# fireworks_env_file = "~/.hermes/.env"   # where FIREWORKS_API_KEY lives
+
+# --- action items -> todo note ---------------------------------------------
+# New recordings get their action items added to your todo note. Recordings
+# ingested before this existed are marked handled and skipped.
+# todo_extract = true
+# todo_note = "~/Documents/OBSIDIAN/To_Do/GENERAL_TODO.md"
+# todo_mode = "api"          # "api" = one Fireworks call, "agent" = headless Hermes
+# todo_model = "accounts/fireworks/models/gpt-oss-120b"
+# todo_reasoning = "low"     # required: the default burns the whole token budget
+#                            # on reasoning and returns empty content
+# todo_fallback_agent = true # hand it to the slow agent if the API call comes back empty
+# todo_max_tokens = 8000
+# todo_agent = "/usr/local/bin/hermes"
+# todo_toolsets = "file"
+# todo_skills = "obsidian"
+# todo_max_turns = 12
+# todo_run_budget = 180      # seconds the agent may run
+# todo_timeout = 300         # seconds before the subprocess is killed
+
+# --- device handling -------------------------------------------------------
+# delete_from_device = true  # remove a recording once its transcript note exists
+# notify = true              # send a short message after an ingest
+# notify_target = "simplex"  # any target `hermes send -t` understands
+# poll_seconds = 3           # how often the watcher checks for the recorder
+# desktop_notify = true      # per-phase desktop popups
+# desktop_notify_progress = true   # false keeps only the final popup
+
+# --- machine paths ---------------------------------------------------------
+# All three default to PATH lookup. Set them if your tools live elsewhere, and
+# note that a systemd unit's PATH is not your shell's: if hermes is installed
+# under a prefix the unit does not carry, the notify and the agent fallback
+# both fail silently without an absolute path here.
+# hermes_bin = "/usr/local/bin/hermes"
+# todo_agent = "/usr/local/bin/hermes"
+# ffmpeg = "/usr/bin/ffmpeg"
+# ffprobe = "/usr/bin/ffprobe"

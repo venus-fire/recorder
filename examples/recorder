@@ -1,0 +1,12 @@
+#!/bin/sh
+# Thin wrapper for the voice recorder pipeline.
+# Sets the CUDA library path (pip-installed cublas/cudnn for ctranslate2),
+# then hands off to the venv interpreter.
+#
+# Adjust REC to wherever you put the checkout, and the python version in SP to
+# match the venv you created.
+REC="$HOME/.local/share/recorder"
+SP="$REC/venv/lib/python3.13/site-packages"
+LD_LIBRARY_PATH="$SP/nvidia/cublas/lib:$SP/nvidia/cudnn/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH
+exec "$REC/venv/bin/python" "$REC/recorder.py" "$@"

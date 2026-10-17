@@ -1,0 +1,20 @@
+[Unit]
+Description=Voice recorder ingest watcher
+Documentation=file:%h/.local/share/recorder/recorder.py
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/recorder watch
+Restart=always
+RestartSec=15
+WorkingDirectory=%h
+# Transcription is heavy; stay out of the way of foreground work.
+Nice=10
+IOSchedulingClass=idle
+# The pipeline is resumable, so being OOM-killed mid-run costs only the file
+# in flight: state is committed per recording, not per pass.
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target
