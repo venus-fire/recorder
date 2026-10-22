@@ -687,8 +687,9 @@ def echoes_initial_prompt(body: str) -> bool:
 
     Without VAD there is nothing to stop whisper from decoding a quiet file as
     the prompt it was given, which is how an 8 second silence became a note
-    reading "Venus Fire, abilIT at Relay Resources, CompTIA Tech." Compare word
-    sets, since punctuation and case do not survive the trip.
+    reciting the configured name, employer and exam names back as if she had
+    said them. Compare word sets, since punctuation and case do not survive the
+    trip.
     """
     prompt = str(CFG.get("initial_prompt") or "")
     words = [w for w in re.findall(r"[a-z0-9]+", body.lower()) if len(w) > 2]
