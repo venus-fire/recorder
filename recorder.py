@@ -63,11 +63,19 @@ DEFAULTS: dict = {
     "model": "~/.local/share/recorder/models/whisper-large-v3-turbo",
     "compute_type": "float16",
     "beam_size": 5,
-    "vad": True,
+    # VAD decides what whisper is allowed to see, and off is the measured
+    # default. Silero scores the quiet far end of a phone call below its
+    # threshold and drops it, so a 6m26s call arrives as her half only: one
+    # recording lost 4x its content that way, and the todo pass then had
+    # nothing to work with. Speech is still MEASURED with VAD (see
+    # measure_speech_seconds) so the no-speech gate and the banner keep
+    # working; it is simply not used to cut the audio.
+    "vad": False,
     "language": "",  # empty = auto-detect per file
     # Vocab the transcriber should expect, so names and jargon come out right
-    # instead of phonetically. VAD is on, so the prompt cannot leak into a
-    # silent file. Keep it to a sentence or two: it biases every decode.
+    # instead of phonetically. Keep it to a sentence or two: it biases every
+    # decode. On a nearly silent file whisper can echo this back as if it were
+    # speech, which is what min_speech_seconds exists to catch.
     # Set your own in config.toml, e.g. "Voice notes. Sam Rivera, Northside
     # Clinic, CompTIA A+, Portland Oregon."
     "initial_prompt": "Voice notes and recorded conversations.",
@@ -98,7 +106,7 @@ DEFAULTS: dict = {
     # Absolute paths to the media tools if they are not on PATH.
     "ffmpeg": "",
     "ffprobe": "",
-    "min_speech_seconds": 1.0,
+    "min_speech_seconds": 2.0,
     "log_max_bytes": 2_000_000,
     # Inline tags written into each note body. The vault's smart-autocorrect
     # plugin (syncFrontmatterTags) rebuilds the frontmatter `tags` field from
@@ -288,6 +296,7 @@ CREATE TABLE IF NOT EXISTS recordings (
     transcript    TEXT,
     todo_at       TEXT,
     todo_added    TEXT,
+    no_speech_at  TEXT,
     deleted_at    TEXT,
     error         TEXT
 );
@@ -301,7 +310,7 @@ def db() -> sqlite3.Connection:
     conn.execute(SCHEMA)
     # Migrate older databases that predate a column.
     have = {row[1] for row in conn.execute("PRAGMA table_info(recordings)")}
-    for column in ("transcript", "todo_at", "todo_added"):
+    for column in ("transcript", "todo_at", "todo_added", "no_speech_at"):
         if column not in have:
             conn.execute(f"ALTER TABLE recordings ADD COLUMN {column} TEXT")
     return conn
@@ -545,6 +554,23 @@ def paragraphs(segments: list[dict], min_gap: float = 1.2, max_len: int = 420) -
     return "\n\n".join(f"[{fmt_ts(t)}] {body}" for t, body in out)
 
 
+def measure_speech_seconds(audio) -> float | None:
+    """How much of the file is speech, by the same VAD faster-whisper uses.
+
+    Measured, not filtered: the number drives the no-speech gate and the
+    "mostly non-speech" banner, while transcription itself sees the whole
+    file. None means the measurement failed, and the caller falls back to the
+    full duration so a broken VAD can never mark a real recording silent.
+    """
+    try:
+        from faster_whisper.vad import VadOptions, get_speech_timestamps
+        spans = get_speech_timestamps(audio, VadOptions())
+        return sum(max(0, s["end"] - s["start"]) for s in spans) / 16000
+    except Exception as exc:  # noqa: BLE001 - a measurement must not break an ingest
+        log(f"vad: speech measurement failed: {exc}")
+        return None
+
+
 def transcribe_file(model, path: Path) -> dict:
     audio = decode_audio(path)
     duration = len(audio) / 16000
@@ -558,17 +584,20 @@ def transcribe_file(model, path: Path) -> dict:
         kwargs["language"] = CFG["language"]
     if CFG["initial_prompt"]:
         kwargs["initial_prompt"] = CFG["initial_prompt"]
+    speech = measure_speech_seconds(audio)
     segments, info = model.transcribe(audio, **kwargs)
     segs = [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
     return {
         "segments": segs,
         "duration": duration,
-        # duration_after_vad, not duration: `duration` is the whole file, and
-        # the difference is what tells a mostly-music recording from a voice
-        # note.
-        "speech_seconds": getattr(info, "duration_after_vad", None) or duration,
+        # Speech seconds come from the VAD measurement, not from
+        # info.duration_after_vad: with vad_filter off the latter is the whole
+        # file, and the gap between speech and duration is what tells a
+        # mostly-music recording from a voice note.
+        "speech_seconds": speech if speech is not None else duration,
         "language": info.language,
         "language_probability": info.language_probability,
+        "model_speech_seconds": getattr(info, "duration_after_vad", None),
     }
 
 
@@ -607,13 +636,13 @@ def write_raw_note(row, result: dict, body: str) -> Path:
     speech = result["speech_seconds"] or 0.0
     total = result["duration"] or 0.0
     meta = f"> {dur} · recorded {recorded} · audio `{row['audio_path']}`"
-    # VAD drops music, singing, and ambient noise, which is what keeps whisper
-    # from hallucinating text into them. Say so when it dropped most of a file
-    # rather than leaving a 5-minute note that reads like one line.
+    # Say when a file is mostly non-speech, so a 5-minute note that reads like
+    # one line explains itself. With vad off the rest was still transcribed, so
+    # the wording says what was measured rather than what was filtered.
     if total > 30 and speech < total * 0.25:
         meta += (f"\n>\n> _Mostly non-speech audio: {fmt_duration(speech)} of speech "
-                 f"detected in {dur}. VAD filtered the rest, so singing, music "
-                 f"and noise are not transcribed._")
+                 f"detected in {dur}. Singing, music and noise are transcribed "
+                 f"as heard, so expect lyrics and fragments from them._")
     description = f"Voice recording transcript, {dur}, recorded {recorded}"
     text = "\n".join([
         frontmatter(
@@ -650,12 +679,37 @@ def write_raw_note(row, result: dict, body: str) -> Path:
     return note
 
 
-def transcribe_phase(redo_all: bool = False) -> int:
+NO_SPEECH_MARKER = "_(no speech detected in this recording)_"
+
+
+def echoes_initial_prompt(body: str) -> bool:
+    """True when a near-silent file made whisper recite the initial prompt.
+
+    Without VAD there is nothing to stop whisper from decoding a quiet file as
+    the prompt it was given, which is how an 8 second silence became a note
+    reading "Venus Fire, abilIT at Relay Resources, CompTIA Tech." Compare word
+    sets, since punctuation and case do not survive the trip.
+    """
+    prompt = str(CFG.get("initial_prompt") or "")
+    words = [w for w in re.findall(r"[a-z0-9]+", body.lower()) if len(w) > 2]
+    if not words or not prompt:
+        return False
+    pw = set(re.findall(r"[a-z0-9]+", prompt.lower()))
+    return sum(1 for w in words if w in pw) / len(words) > 0.8
+
+
+def transcribe_phase(redo_all: bool = False, limit: int | None = None,
+                     confirmed: bool = False) -> int:
     conn = db()
     where = "audio_path IS NOT NULL" + ("" if redo_all else " AND transcribed_at IS NULL")
     rows = conn.execute(f"SELECT * FROM recordings WHERE {where} ORDER BY name").fetchall()
     if not rows:
         log("transcribe: nothing pending")
+        return 0
+    if limit:
+        rows = rows[:limit]
+    if redo_all and not confirmed:
+        refuse_all("transcribe", len(rows), sum(r["duration"] or 0 for r in rows))
         return 0
 
     log(f"transcribe: {len(rows)} file(s) pending")
@@ -680,12 +734,31 @@ def transcribe_phase(redo_all: bool = False) -> int:
             t0 = time.time()
             result = transcribe_file(model, path)
             body = paragraphs(result["segments"])
-            if result["speech_seconds"] < CFG["min_speech_seconds"] or not body:
-                body = "_(no speech detected in this recording)_"
+            gated = (result["speech_seconds"] < CFG["min_speech_seconds"]
+                     or not body or echoes_initial_prompt(body))
+            if gated:
+                # No note for silence. The audio is kept in ~/Recordings and the
+                # row records that the decision was made, which is what lets the
+                # device copy be cleared; a note saying "no speech detected"
+                # only clutters the transcript folder.
+                conn.execute(
+                    """UPDATE recordings SET transcribed_at=?, note_path=NULL, duration=?,
+                       language=?, speech_seconds=?, transcript=?, no_speech_at=?, error=NULL
+                       WHERE sha256=?""",
+                    (datetime.now().strftime("%Y-%m-%d %H:%M"), result["duration"],
+                     result["language"], result["speech_seconds"], NO_SPEECH_MARKER,
+                     datetime.now().strftime("%Y-%m-%d %H:%M"), row["sha256"]),
+                )
+                conn.commit()
+                done += 1
+                log(f"transcribe: {row['name']} {fmt_duration(result['duration'])} "
+                    f"speech={result['speech_seconds']:.1f}s -> no note, audio kept")
+                continue
             note = write_raw_note(row, result, body)
             conn.execute(
                 """UPDATE recordings SET transcribed_at=?, note_path=?, duration=?,
-                   language=?, speech_seconds=?, transcript=?, error=NULL WHERE sha256=?""",
+                   language=?, speech_seconds=?, transcript=?, no_speech_at=NULL, error=NULL
+                   WHERE sha256=?""",
                 (datetime.now().strftime("%Y-%m-%d %H:%M"), str(note), result["duration"],
                  result["language"], result["speech_seconds"], body, row["sha256"]),
             )
@@ -732,27 +805,36 @@ Output exactly this shape, nothing before it:
 
 TITLE: <a specific human title for this recording, under 60 characters, no colon, no quotes, no slash, describes the actual content>
 DESCRIPTION: <one line, under 80 characters, no colon-space, describes the recording>
+KIND: <exactly one of: call, conversation, dictation, class, media>
 
 ## Summary
 <2-4 sentences. If more than one person speaks, say who is who when the
 recording makes it clear, and say the speakers are unidentified when it does not.>
 
 ## Key points
-- <point>
+<ONLY what the summary above does not already say: exact dates, numbers,
+names, providers, quotes worth keeping, and the facts a later reader would
+need. Never restate a sentence the summary already made.>
 
 ## Decisions
-- <decision, or "None stated">
+<What was actually decided or agreed, by whom.>
 
 ## Action items
-- <action>; who has to do it; and the few words from the transcript that show
-  who. Use "unclear" for the owner when the transcript does not settle it, and
-  never assign an owner by guessing. Actions that someone asks of her are hers.
-
-## People, places, things
-- <names, providers, orgs, amounts mentioned>
+<Each one: the action, who has to do it, and the few words from the transcript
+that show who. Use "unclear" for the owner when the transcript does not settle
+it, and never assign an owner by guessing. Actions that someone asks of her are
+hers.>
 
 ## Open questions
-- <unresolved thing, or "None stated">
+<An unresolved thing that matters>
+
+Omit any section whose content would be empty. Never write "None stated",
+"None", "N/A" or a placeholder bullet, and never keep a heading you have
+nothing to put under. A five-section, two-section or one-section note is
+correct when that is all there is.
+
+Do not write a section for names or things mentioned: useful names belong in
+Key points, everything else does not belong in the note.
 
 Inline #tags belong at the very end of the body. Do not write frontmatter.
 
@@ -861,8 +943,8 @@ def fireworks_chat(messages: list[dict], max_tokens: int, label: str,
     return content
 
 
-def call_summary_api(transcript: str) -> tuple[str, str]:
-    """Ask the configured model for a description line plus a markdown summary.
+def call_summary_api(transcript: str) -> tuple[str, str, str, str]:
+    """Ask the configured model for the header lines plus a markdown summary.
 
     The model behind this router is a reasoning model: it can spend the whole
     token budget on reasoning and return an empty `content`. So the budget
@@ -908,20 +990,24 @@ def call_summary_api(transcript: str) -> tuple[str, str]:
 
     title = ""
     description = "Voice note transcript summary"
+    kind = ""
     for line in content.splitlines()[:6]:
         if line.upper().startswith("TITLE:") and not title:
             title = line.split(":", 1)[1].strip().strip('"')
         elif line.upper().startswith("DESCRIPTION:") and description == "Voice note transcript summary":
             description = line.split(":", 1)[1].strip().strip('"')[:79] or description
+        elif line.upper().startswith("KIND:") and not kind:
+            kind = line.split(":", 1)[1].strip().lower()
     # Drop the header lines from the body.
     body_lines = []
     for line in content.splitlines():
         upper = line.upper()
-        if upper.startswith("TITLE:") or upper.startswith("DESCRIPTION:"):
+        if (upper.startswith("TITLE:") or upper.startswith("DESCRIPTION:")
+                or upper.startswith("KIND:")):
             continue
         body_lines.append(line)
     content = "\n".join(body_lines).lstrip("\n")
-    return title, description, content
+    return title, description, kind, content
 
 
 def safe_title(title: str, fallback: str) -> str:
@@ -937,7 +1023,7 @@ def safe_title(title: str, fallback: str) -> str:
     return name or fallback
 
 
-def write_summary_note(row, title: str, description: str, body: str) -> Path:
+def write_summary_note(row, title: str, description: str, kind: str, body: str) -> Path:
     sum_dir = Path(CFG["vault"]) / CFG["transcripts_subdir"] / "summarized"
     sum_dir.mkdir(parents=True, exist_ok=True)
     stem = Path(row["name"]).stem
@@ -963,7 +1049,8 @@ def write_summary_note(row, title: str, description: str, body: str) -> Path:
             created=f"{recorded} 00:00",
             updated=now,
             description=description,
-            generated=f"agent/{CFG['summary_model'].rsplit('/', 1)[-1]}",
+            generated=f"api/{CFG['summary_model'].rsplit('/', 1)[-1]}",
+            kind=(kind or None),
             generated_at=now,
             recorded=recorded,
             duration=fmt_duration(row["duration"]),
@@ -1047,7 +1134,22 @@ def link_raw_note(raw_path: Path, summary_stem: str) -> None:
     raw_path.write_text("\n".join(kept) + tail)
 
 
-def summarize_phase(redo_all: bool = False) -> int:
+def refuse_all(name: str, count: int, audio_seconds: float) -> None:
+    """Say what a --all redo would cost, and change nothing.
+
+    Every one of these phases makes a model call per recording, so a --all run
+    over a full archive is a budget event, not a convenience. It has to be
+    asked for twice, and --limit caps how many go through in one run.
+    """
+    print(f"{name} --all would reprocess {count} recording(s), "
+          f"{fmt_duration(audio_seconds)} of audio, one model call each.")
+    print("Nothing was changed.")
+    print("Re-run with --yes to do it, or add --limit N to cap the run.")
+    log(f"{name}: --all refused, confirmed=false, {count} recording(s) projected")
+
+
+def summarize_phase(redo_all: bool = False, limit: int | None = None,
+                    confirmed: bool = False) -> int:
     if not CFG["summarize"]:
         log("summarize: disabled")
         return 0
@@ -1058,14 +1160,21 @@ def summarize_phase(redo_all: bool = False) -> int:
     if not rows:
         log("summarize: nothing pending")
         return 0
+    if limit:
+        rows = rows[:limit]
+    if redo_all and not confirmed:
+        refuse_all("summarize", len(rows), sum(r["duration"] or 0 for r in rows))
+        return 0
     done = 0
     for row in rows:
         note = Path(row["note_path"]) if row["note_path"] else None
         if not note or not note.exists():
             continue
-        if (row["speech_seconds"] or 0) < CFG["min_speech_seconds"] and not redo_all:
-            # Silence is not worth an API call on a normal pass, but a
-            # deliberate --all still names and files those notes.
+        if ((row["speech_seconds"] or 0) < CFG["min_speech_seconds"]
+                or NO_SPEECH_MARKER in (row["transcript"] or "")):
+            # There is nothing to summarize. Skipping on a --all too: it is how
+            # twelve notes reading "no speech detected" collected six sections
+            # of empty headings each, which is noise in the folder she browses.
             log(f"summarize: {row['name']} has no speech, skipped")
             conn.execute("UPDATE recordings SET summarized_at=? WHERE sha256=?",
                          (datetime.now().strftime("%Y-%m-%d %H:%M"), row["sha256"]))
@@ -1073,8 +1182,8 @@ def summarize_phase(redo_all: bool = False) -> int:
             continue
         try:
             source = (row["transcript"] or "").strip() or read_note_body(note)
-            title, description, body = call_summary_api(source)
-            out = write_summary_note(row, title, description, body)
+            title, description, kind, body = call_summary_api(source)
+            out = write_summary_note(row, title, description, kind, body)
             link_raw_note(note, out.stem)
             conn.execute("UPDATE recordings SET summary_path=?, summarized_at=?, error=NULL WHERE sha256=?",
                          (str(out), datetime.now().strftime("%Y-%m-%d %H:%M"), row["sha256"]))
@@ -1131,6 +1240,18 @@ subtask of an existing item. Match on the action, not the wording: "check in
 periodically to make sure X isnt going crazy" and "make sure X isnt going crazy"
 are the same item. If an existing item only needs a date or a detail from this
 recording, put that in "updates" instead of adding a new item.
+
+A chase is its own item. When she has to follow up with someone who was
+supposed to act and might not, that is a new item with its own checkbox, not a
+clause appended to an existing line. Measured without this rule, the chase was
+emitted once in four runs, because the model treats it as a detail of the task
+it belongs to.
+
+Never add an item for something a provider said they would check, verify or
+handle. "We'll verify that" and "I'll call the office" are his work, even when
+insurance or a referral is the subject. Measured without this rule, a
+CareOregon verification item appeared in four runs out of four, on a call where
+the receptionist had already said he would verify it himself.
 
 Keep each request as its own item. Two things she was asked to do are two items,
 not one line joined with "and": merging them loses the ability to tick them off
@@ -1276,8 +1397,11 @@ def apply_todo_json(todo_path: Path, payload: dict) -> list[str]:
         grouped.setdefault(section, []).extend(rendered)
         added.append(item.get("text", "").strip())
 
-    # "updates" appends a date or detail to an existing line rather than adding
-    # a near-duplicate one.
+    # "updates" appends a detail to an existing line rather than adding a
+    # near-duplicate one. The append has to be idempotent: `todo --only` and
+    # `todo --all` re-run this, and an unguarded append turned
+    # "follow up on the sleep appointment" into a line that grew a new clause
+    # on every pass.
     for update in payload.get("updates") or []:
         if not isinstance(update, dict):
             continue
@@ -1288,6 +1412,9 @@ def apply_todo_json(todo_path: Path, payload: dict) -> list[str]:
         for i, line in enumerate(lines):
             m = TODO_ITEM_RE.match(line)
             if m and item_key(m.group(1)) == target:
+                if item_key(extra) and item_key(extra) in item_key(m.group(1)):
+                    log(f"todo: update already on the line, skipped: {extra[:60]}")
+                    break
                 lines[i] = f"{line.rstrip()} {extra}"
                 log(f"todo: updated existing item with {extra[:60]}")
                 break
@@ -1549,7 +1676,8 @@ def run_todo_extraction(row, summary: Path) -> tuple[bool, list[str], str]:
     return True, parse_todo_additions(out), ""
 
 
-def todo_phase(redo_all: bool = False, only: str | None = None) -> list[str]:
+def todo_phase(redo_all: bool = False, only: str | None = None,
+               limit: int | None = None, confirmed: bool = False) -> list[str]:
     if not CFG["todo_extract"]:
         log("todo: disabled")
         return []
@@ -1566,8 +1694,13 @@ def todo_phase(redo_all: bool = False, only: str | None = None) -> list[str]:
         summary = Path(row["summary_path"])
         if summary.exists():
             pending.append((row, summary))
+    if limit:
+        pending = pending[:limit]
     if not pending:
         log("todo: nothing pending")
+        return []
+    if redo_all and not confirmed:
+        refuse_all("todo", len(pending), sum(r["duration"] or 0 for r, _ in pending))
         return []
 
     added: list[str] = []
@@ -1630,9 +1763,13 @@ def delete_phase() -> int:
         log("delete: disabled")
         return 0
     conn = db()
+    # A no-speech recording has no note by design: the row itself carries the
+    # decision, and the audio copy plus its hash is the thing that must exist
+    # before the card is touched.
     rows = conn.execute(
         """SELECT * FROM recordings
-           WHERE deleted_at IS NULL AND note_path IS NOT NULL AND audio_path IS NOT NULL
+           WHERE deleted_at IS NULL AND audio_path IS NOT NULL
+             AND (note_path IS NOT NULL OR no_speech_at IS NOT NULL)
            ORDER BY name"""
     ).fetchall()
     if not rows:
@@ -1652,8 +1789,11 @@ def delete_phase() -> int:
         if not copy.exists() or sha256_of(copy) != row["sha256"]:
             log(f"delete: SKIP {row['name']}, local copy missing or changed")
             continue
-        if not Path(row["note_path"]).exists():
+        if row["note_path"] and not Path(row["note_path"]).exists():
             log(f"delete: SKIP {row['name']}, transcript note missing")
+            continue
+        if not row["note_path"] and not row["no_speech_at"]:
+            log(f"delete: SKIP {row['name']}, neither a note nor a no-speech marker")
             continue
         target = mp / row["rel_path"]
         if not target.exists():
@@ -1845,6 +1985,7 @@ def cmd_status() -> None:
         "transcribed": sum(1 for r in rows if r["transcribed_at"]),
         "summarized": sum(1 for r in rows if r["summarized_at"]),
         "action items pulled": sum(1 for r in rows if r["todo_at"]),
+        "no speech, no note": sum(1 for r in rows if r["no_speech_at"]),
         "cleared from device": sum(1 for r in rows if r["deleted_at"]),
         "errors": sum(1 for r in rows if r["error"]),
     }
@@ -1866,12 +2007,20 @@ def main() -> int:
     sub.add_parser("copy")
     sub.add_parser("delete")
     sub.add_parser("status")
+    def add_redo_flags(parser):
+        parser.add_argument("--all", action="store_true",
+                            help="reprocess everything, including work already done")
+        parser.add_argument("--limit", type=int, metavar="N",
+                            help="stop after N recordings")
+        parser.add_argument("--yes", action="store_true",
+                            help="required with --all: confirms the model spend")
+
     p_t = sub.add_parser("transcribe")
-    p_t.add_argument("--all", action="store_true")
+    add_redo_flags(p_t)
     p_s = sub.add_parser("summarize")
-    p_s.add_argument("--all", action="store_true")
+    add_redo_flags(p_s)
     p_todo = sub.add_parser("todo")
-    p_todo.add_argument("--all", action="store_true")
+    add_redo_flags(p_todo)
     p_todo.add_argument("--only", metavar="STEM",
                         help="one recording stem, e.g. 261016_0054")
     args = parser.parse_args()
@@ -1886,11 +2035,12 @@ def main() -> int:
     elif args.cmd == "copy":
         copy_phase()
     elif args.cmd == "transcribe":
-        transcribe_phase(redo_all=args.all)
+        transcribe_phase(redo_all=args.all, limit=args.limit, confirmed=args.yes)
     elif args.cmd == "summarize":
-        summarize_phase(redo_all=args.all)
+        summarize_phase(redo_all=args.all, limit=args.limit, confirmed=args.yes)
     elif args.cmd == "todo":
-        todo_phase(redo_all=args.all, only=args.only)
+        todo_phase(redo_all=args.all, only=args.only, limit=args.limit,
+                   confirmed=args.yes)
     elif args.cmd == "delete":
         delete_phase()
     elif args.cmd == "status":

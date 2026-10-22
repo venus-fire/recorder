@@ -12,9 +12,12 @@
 # model = "~/.local/share/recorder/models/whisper-large-v3-turbo"
 # compute_type = "float16"   # float16 | int8_float16 | int8
 # beam_size = 5
-# vad = true                 # skip silence
+# vad = false                # false = transcribe everything. On, silero drops
+#                            # the quiet far end of a phone call and half the
+#                            # conversation with it. Speech is still measured
+#                            # with it for the no-speech gate.
 # language = ""              # "" = detect per file, or pin e.g. "en"
-# min_speech_seconds = 1.0   # below this the note is marked as no-speech
+# min_speech_seconds = 2.0   # below this the note is marked as no-speech
 
 # --- who this is for -------------------------------------------------------
 # The vocab the transcriber should expect, and the name the action-item prompts

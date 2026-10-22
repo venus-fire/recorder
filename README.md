@@ -80,7 +80,8 @@ All settings live in `DEFAULTS` at the top of `recorder.py`. `~/.config/recorder
 | `model` | `.../models/whisper-large-v3-turbo` | Path to the CTranslate2 model |
 | `initial_prompt` | generic | Names and jargon the transcriber should expect |
 | `subject` | `the user` | Whose action items the last phase is looking for |
-| `min_speech_seconds` | `1.0` | Below this a recording is marked as having no speech |
+| `vad` | `false` | `false` transcribes the whole file. On, silero drops the quiet far end of phone calls, and half the conversation with it |
+| `min_speech_seconds` | `2.0` | Below this a recording is marked as having no speech |
 | `delete_from_device` | `true` | Clear recordings off the card once transcribed |
 | `todo_mode` | `api` | `api` for one API call, `agent` for a headless agent |
 | `todo_model` | `gpt-oss-120b` | Must be a model that does not reason past the budget |
@@ -95,14 +96,14 @@ All settings live in `DEFAULTS` at the top of `recorder.py`. `~/.config/recorder
 recorder watch                  # long-running watcher, what the service runs
 recorder ingest                 # one full pass, now
 recorder copy                   # one phase at a time
-recorder transcribe [--all]
-recorder summarize [--all]
-recorder todo [--all] [--only STEM]
+recorder transcribe [--all --yes [--limit N]]
+recorder summarize [--all --yes [--limit N]]
+recorder todo [--all --yes [--limit N]] [--only STEM]
 recorder delete
 recorder status
 ```
 
-`--all` redoes everything rather than only the pending work, which is what you want after changing a prompt. `recorder todo --only 261016_0054` reprocesses a single recording by its filename stem.
+`--all` redoes everything rather than only the pending work, which is what you want after changing a prompt. It also makes one model call per recording, so it refuses to run unless `--yes` confirms the spend, and it prints what it would have cost. `--limit N` caps a redo at N recordings. `recorder todo --only 261016_0054` reprocesses a single recording by its filename stem.
 
 The single-phase commands deliberately skip the lock that `ingest` takes, so do not run `summarize` by hand while the watcher is mid-pass: they write the same notes.
 
@@ -112,17 +113,17 @@ The single-phase commands deliberately skip the lock that `ingest` takes, so do 
 
 The card is unmounted here, before any GPU work, so the recorder is free to unplug while transcription runs.
 
-**Transcribe.** Loads `faster-whisper` on CUDA, float16, beam 5, VAD on. The transcript is written both to a verbatim note in the vault and into the database. The database copy is what the next phase reads, not the note, because an Obsidian autocorrect plugin rewrites notes underneath the pipeline and would race it.
+**Transcribe.** Loads `faster-whisper` on CUDA, float16, beam 5, VAD off. The filter is the wrong tool here: silero scores the quiet far end of a phone call below its threshold and deletes it, which loses half a conversation, so speech is only measured with VAD, never filtered out of the audio. The transcript is written both to a verbatim note in the vault and into the database. A recording with no speech gets no note at all: the row carries that decision, and the audio stays in `~/Recordings`. The database copy is what the next phase reads, not the note, because an Obsidian autocorrect plugin rewrites notes underneath the pipeline and would race it.
 
 Each file is wrapped in its own error handler. One corrupt file records an error and the batch continues.
 
-**Summarize.** Sends the transcript to a Fireworks model that returns a title, a description and a body. The note is named from that title with the recording date prefixed, so the folder still sorts chronologically and a summary is findable by what it says rather than by a recorder stem. Any previous name for the same recording is pruned first, so a re-run does not strand orphans, and the raw note gets a `related:` back-link to the summary.
+**Summarize.** Sends the transcript to a Fireworks model that returns a title, a description, a kind (`call`, `conversation`, `dictation`, `class`, `media`) and a body of up to five sections: Summary, Key points, Decisions, Action items, Open questions. A section with nothing in it is left out rather than filled with "None stated". The note is named from that title with the recording date prefixed, so the folder still sorts chronologically and a summary is findable by what it says rather than by a recorder stem. Any previous name for the same recording is pruned first, so a re-run does not strand orphans, and the raw note gets a `related:` back-link to the summary.
 
 **Action items.** The default path is a single API call that returns JSON, and the pipeline does the inserting: filing each item into the right section, skipping anything already on the list, appending dates and details to existing lines rather than adding near-duplicates, and bumping the file's `updated` field. A headless agent path exists behind `todo_mode = "agent"` for when the extraction needs to look something up.
 
 **Maintenance.** Runs the vault's lint and manifest generator, but only when something was actually written.
 
-**Delete.** Runs last, and only for recordings that have a transcript note. Two gates per file: the local copy must still exist and still hash to the recorded sha256, and the note must be on disk. Only then is the file removed from the card.
+**Delete.** Runs last, and only for recordings the pipeline has finished with: either a transcript note on disk, or a no-speech marker in the row. Two gates per file: the local copy must still exist and still hash to the recorded sha256, and the note must be on disk when the row names one. Only then is the file removed from the card.
 
 **Report.** One message to a chat platform, plus desktop notifications per phase. The "safe to unplug" notification reads the pending count from the database rather than from the pass that just ran, because a failed mount or a skipped delete leaves files on the card and asking the pass would make the all-clear a lie.
 
